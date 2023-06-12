@@ -30,12 +30,11 @@ video_name = videos[0]
 code_config.set_result_directory(video_name)
 
 # Define ball tracking variable and execute tracking
-# ballTracker = BallTracking(video_name=video_name, Cfg=code_config)
-# ballTracker.track_ball()
+ballTracker = BallTracking(video_name=video_name, Cfg=code_config)
+ballTracker.track_ball()
 
 c_ballTracker = BallTracking_improved(video_name=video_name, Cfg=code_config)
 c_ballTracker.custom_tracking()
-
 
 # Get average mask from the three first frames of the video
 lines, bottom_mask, top_mask, H, invH = courtDetection(video_name)
@@ -136,14 +135,15 @@ top_coords_p1, top_coords_p2 = calculate_feet_positions(invH=invH, player_1_boxe
                                                         player_2_boxes=boxes_p2,
                                                         keypoints_p2=playerDetector.player_top_keypoints)
 
-def resize_upper_view(input_image):
 
+def resize_upper_view(input_image):
     new_width = input_image.shape[1] // 2
     new_height = input_image.shape[0] // 2
     resized_image = cv2.resize(input_image, (new_width, new_height))
     resized_image_rgb = cv2.cvtColor(resized_image, cv2.COLOR_GRAY2RGB)
 
     return resized_image_rgb
+
 
 original_court = referenceCourt.court.copy()
 
@@ -170,4 +170,3 @@ for img in frames:
 top_view.release()
 out.release()
 playerDetector.release_video()
-
