@@ -7,7 +7,9 @@ import torchvision.models as models
 
 from PIL import Image
 from torchvision.transforms import transforms as transforms
-from skimage.feature import local_binary_pattern
+# from skimage.feature import local_binary_pattern
+
+from source.pose_estimation.keypointRCNN import load_model
 
 import source.pose_estimation.utils as utils_pose
 from source.pose_estimation.sort import Sort
@@ -19,7 +21,7 @@ print('GPU Use : ', torch.cuda.is_available())
 def get_model(min_size=800):
     # Initialize the model
     model = models.detection.keypointrcnn_resnet50_fpn(pretrained=True, num_keypoints=17, min_size=min_size)
-
+    # model = load_model()
     return model
 
 
@@ -162,7 +164,7 @@ class playersDetection:
         self.top_candidate_boxes = {}
         self.top_player_first_h = None
         self.top_misses = 0
-        self.min_top_thr = 0.5
+        self.min_top_thr = 0.35
 
         # Define top player tracking related class variables
         self.best_top_candidate_id = None
@@ -250,7 +252,7 @@ class playersDetection:
         self.top_baseline = baseline
 
         # Detect all persons in the top part of the court.
-        outputs = self.detect(orig_frame=top_mask, image_court=iteration_mask)
+        outputs = self.detect(orig_frame=frame, image_court=iteration_mask)
         num_detections = len(outputs[0]['boxes'])
 
         if num_detections > 0:
@@ -270,12 +272,13 @@ class playersDetection:
                     bl_x1, bl_y1, bl_x2, bl_y2 = baseline
                     distances = [distance_point_to_line(bbox=bboxes[j], baseline_start=(bl_x1, bl_y1),
                                                         baseline_end=(bl_x2, bl_y2)) for j in index]
-                    scores = (1 / np.array(distances)) * 0.65 + scores * 0.45
+                    scores = (1 / np.array(distances)) * 0.65 + scores * 0.35
                     outputs_id = np.argmax(scores)
                     print('Candidate id: ', outputs_id, ' distance: ', distances, ' and score: ', scores)
                     if distances[outputs_id] < 100.:
                         self.best_top_candidate_id = outputs_id + 1
-                        self.top_player_first_h = self.model_top_candidate(image=frame, bbox=bboxes[outputs_id])
+                        # self.top_player_first_h = self.model_top_candidate(image=frame, bbox=bboxes[outputs_id])
+                        self.top_player_first_h = self.model_top_candidates_Hue(image=frame, bbox=bboxes[outputs_id])
                     else:
                         bboxes = None
                         scores = None
@@ -290,7 +293,8 @@ class playersDetection:
             for box in tracked_candidates:
 
                 candidate_id = int(box[4])
-                hist = self.model_top_candidate(image=frame, bbox=box[:4])
+                # hist = self.model_top_candidate(image=frame, bbox=box[:4])
+                hist = self.model_top_candidates_Hue(image=frame, bbox=box[:4])
 
                 # If current candidate never appeared, indicate as new detection and create space in dictionaries.
                 if candidate_id not in self.top_candidate_boxes.keys():
@@ -316,52 +320,19 @@ class playersDetection:
 
         return boxes
 
-    def model_top_candidate(self, image, bbox):
-        """
-        Having all the detections in the top of the court, select the best candidate by using minimum distance from
-        bounding box center to top baseline.
-        Once the best candidate is defined, codify texture information of bounding box by means of Local Binary Patterns
-        (LBP descriptor) in order to compare it all over the video and refine the tracking.
-        # Note that best candidate bounding box: self.top_candidate_boxes[self.best_top_candidate_id][0]
-        """
+    def model_top_candidates_Hue(self, image, bbox):
 
         # Crop image using the best candidate's bbox as ROI.
         bt_x0, bt_y0, bt_x1, bt_y1 = bbox
         bt_x0, bt_y0, bt_x1, bt_y1 = max(int(bt_x0), 0), max(int(bt_y0), 0), \
-            min(int(bt_x1), int(self.height)), min(int(bt_y1), int(self.width))
-        roi = image[bt_y0:bt_y1, bt_x0:bt_x1, :]
-        try:
-            gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        except:
-            gray_roi = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # Compute LBP descriptor from ROI, to help in ReID if player is lost.
-        radius = 3
-        n_points = 8 * radius
-        lbp = local_binary_pattern(gray_roi, n_points, radius, method='uniform')
-
-        # Extract and normalize histogram from LBP descriptors to define target regarding bbox size.
-        hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, n_points + 3), range=(0, n_points + 2))
-        hist = hist.astype("float")
-        hist /= (hist.sum() + 1e-7)
-
-        return hist
-
-    def model_top_candidates_colorH(self, image, bbox):
-        """
-        Use color information to model candidate, in order to have a better tracking and Re-Identification.
-        """
-
-        # Crop image using the best candidate's bbox as ROI.
-        bt_x0, bt_y0, bt_x1, bt_y1 = bbox
-        bt_x0, bt_y0, bt_x1, bt_y1 = max(int(bt_x0), 0), max(int(bt_y0), 0), \
-            min(int(bt_x1), int(self.height)), min(int(bt_y1), int(self.width))
+            min(int(bt_x1), int(self.width)), min(int(bt_y1), int(self.height))
         roi = image[bt_y0:bt_y1, bt_x0:bt_x1, :]
 
-        # Compute color histogram for ROI
-        bins = 8  # Define number of bins.
-        hist = cv2.calcHist([roi], [0, 1, 2], None, [bins, bins, bins], [0, 128, 0, 128, 0, 128])
-        hist = cv2.normalize(hist, hist).flatten()
+        hsv_image = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hue_channel = hsv_image[:, :, 0]
+
+        hist, _ = np.histogram(hue_channel.flatten(), bins=256, range=[0, 256])
+        hist = hist.astype(float) / np.sum(hist)
 
         return hist
 
@@ -511,14 +482,12 @@ class playersDetection:
     def find_player_top(self):
 
         # Initialize variables
-        # self.player_top_boxes = [None] * (self.total_fps - 1)
         keypoints = [None] * self.total_fps
 
         # Get the first no None element in players ID's list to start tracking.
         playerID = next((element for element in self.top_player_IDs if element is not None), None)
         fisrt_player = next((index for index, element in enumerate(self.top_player_IDs) if element is not None), None)
 
-        first_appearance_ids = list(set(self.candidate_first_appearance.keys()))
         first_appearance_frame = list(set(self.candidate_first_appearance.values()))
 
         for frame_idx in range(fisrt_player, self.total_fps - 1):
@@ -530,6 +499,7 @@ class playersDetection:
             print('Last Bounding box: ', last_bbox)
 
             if top_player_bbox is not None:
+                # Get all histograms stored from candidate first appearance until actual frame to get las available hist
                 cumulated_hists = self.top_candidate_appearance[playerID][fisrt_player:frame_idx]
                 last_hist = next((element for element in reversed(cumulated_hists) if element is not None), None)
 
@@ -537,6 +507,7 @@ class playersDetection:
                     playerID = self.reId(last_bbox=last_bbox, last_Hist=last_hist,
                                          frame_idx=frame_idx, playerID=playerID)
             else:
+                # Get all histograms stored from candidate first appearance until actual frame to get las available hist
                 cumulated_hists = self.top_candidate_appearance[playerID][fisrt_player:frame_idx]
                 last_hist = next((element for element in reversed(cumulated_hists) if element is not None), None)
 
@@ -567,7 +538,7 @@ class playersDetection:
                 # Normalize histograms
                 norm_hist1 = last_playerHist / np.sum(last_playerHist)
                 # Combine and normalize histograms using weighted averaging
-                combined_hist = (0.65 * norm_hist1) + (0.35 * norm_hist2)
+                combined_hist = (0.1 * norm_hist1) + (0.9 * norm_hist2)
                 combined_hist /= np.sum(combined_hist)
 
                 candidateBbox = self.top_candidate_boxes[candidate_id][frame_idx]
@@ -576,9 +547,8 @@ class playersDetection:
                 bc_score = min(calculate_bhattacharyya_distance(hist1=norm_hist1, hist2=norm_hist2), 1)
 
                 # Combine Inverse Bhattacharyya Distance and distance to previous player bbox distance to get score.
-                score = bc_score * 0.6 + distance * 0.4
-                print('Candidate id: ', candidate_id, ' Score: ', score, ' with respect to: ',
-                      playerID)
+                score = bc_score * 0.8 + distance * 0.2
+                print('Candidate id: ', candidate_id, ' Score: ', score, ' with respect to: ', playerID)
 
                 candidate_area = area_of_box(box=candidateBbox)
                 lastDect_area = area_of_box(box=last_bbox)
@@ -597,10 +567,8 @@ class playersDetection:
         if box is not None:
             if bottom:
                 keypoints = self.player_bottom_keypoints[frame_num]
-            else:
-                keypoints = self.player_top_keypoints[frame_num]
+                frame = utils_pose.draw_keypoints_and_boxes(keypoints=keypoints, bbox=box, image=frame)
 
-            frame = utils_pose.draw_keypoints_and_boxes(keypoints=keypoints, bbox=box, image=frame)
             cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), [255, 0, 0], 2)
         return frame
 

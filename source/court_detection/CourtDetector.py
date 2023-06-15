@@ -1,6 +1,7 @@
 import cv2
 import os
 import numpy as np
+import matplotlib.pyplot as plt
 
 from source.court_detection.CourtLineCandidateDetector import CourtLineCandidateDetector
 from source.court_detection.TennisCourtFitter import TennisCourtFitter, _threshold

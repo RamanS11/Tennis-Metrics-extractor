@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import json
 import cv2
 import os
 
@@ -12,7 +13,7 @@ from source.pose_estimation.utils import calculate_feet_positions
 from source.ball_tracking.TrackNet_BallTracker import BallTracking
 from source.ball_tracking.custom_BallTracker import BallTracking_improved
 
-from utils import get_video_properties, release_video
+from utils import get_video_properties, release_video, guardar_video, resize_upper_view
 from config import cfg
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -25,7 +26,7 @@ globals()
 videos = ['game1_Clip4.mp4', 'game2_Clip8.mp4', 'game3_Clip7.mp4', 'video_input2.mp4', 'video_input3.mp4',
           'video_input4.mp4', 'video_input5.mp4', 'video_input6.mp4', 'video_input8.mp4', 'point_1.mp4', 'point_5.mp4']
 
-video_name = videos[0]
+video_name = videos[2]
 
 code_config.set_result_directory(video_name)
 
@@ -77,6 +78,8 @@ number_frames = int(vid.get(cv2.CAP_PROP_FRAME_COUNT))
 frames = []
 original_frames = []
 
+top_Detections = []
+
 while return_value:
 
     return_value, frame = vid.read()
@@ -103,10 +106,9 @@ while return_value:
 
         new_frame = cv2.resize(frame, (v_width, v_height))
         frames.append(new_frame)
-        '''
-        cv2.imshow('top boxes', top_boxes)
+        cv2.imshow('top_boxes', top_boxes)
         cv2.waitKey(1)
-        '''
+        top_Detections.append(top_boxes)
         print('Framce id: ', frame_count)
         frame_count += 1
     else:
@@ -115,6 +117,7 @@ while return_value:
 
 # Release video object.
 release_video(vid)
+guardar_video(frames=top_Detections, nombre_video=os.path.join(code_config.get_FINAL_DIR(), 'detecciones_top'), fps=fps)
 
 # empty Torch cache memory
 torch.cuda.empty_cache()
@@ -125,6 +128,20 @@ playerDetector.find_player_top()
 boxes_p1 = playerDetector.player_bottom_boxes
 boxes_p2 = playerDetector.player_top_boxes
 
+
+# Guardar el diccionario con bboxes del jugador 1 en un archivo JSON
+path_result_p1 = os.path.join(code_config.get_RESULT_VIDEO_OUTPUT(), 'coords_p1.json')
+bounding_boxes_serializable_1 = {key: value.tolist() for key, value in boxes_p1.items()}
+with open(path_result_p1, 'w') as file:
+    json.dump(bounding_boxes_serializable_1, file)
+
+# Guardar el diccionario con bboxes del jugador 2 en un archivo JSON
+path_result_p2 = os.path.join(code_config.get_RESULT_VIDEO_OUTPUT(), 'coord_p2.json')
+bounding_boxes_serializable_2 = {key: value.tolist() if isinstance(value, np.ndarray) else value
+                                for key, value in boxes_p2.items() if value is not None}
+with open(path_result_p2, 'w') as file:
+    json.dump(bounding_boxes_serializable_2, file)
+
 # initialize frame counters
 frame_number = 0
 orig_frame = 0
@@ -134,16 +151,6 @@ top_coords_p1, top_coords_p2 = calculate_feet_positions(invH=invH, player_1_boxe
                                                         keypoints_p1=playerDetector.player_bottom_keypoints,
                                                         player_2_boxes=boxes_p2,
                                                         keypoints_p2=playerDetector.player_top_keypoints)
-
-
-def resize_upper_view(input_image):
-    new_width = input_image.shape[1] // 2
-    new_height = input_image.shape[0] // 2
-    resized_image = cv2.resize(input_image, (new_width, new_height))
-    resized_image_rgb = cv2.cvtColor(resized_image, cv2.COLOR_GRAY2RGB)
-
-    return resized_image_rgb
-
 
 original_court = referenceCourt.court.copy()
 
