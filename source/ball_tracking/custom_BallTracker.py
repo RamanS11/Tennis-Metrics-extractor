@@ -12,6 +12,7 @@ import cv2
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.optimize import least_squares
 from scipy.signal import argrelextrema, argrelmin, argrelmax
 
 # own imports
@@ -118,16 +119,15 @@ def outliers_detector(prediction, max_d_x, max_d_y):
     """
     # Only evaluate over available annotations
     valid_prediction = []
-    visibility = [True] * len(prediction)
+    visibility = [False] * len(prediction)
 
     for p in prediction:
         if p.vis == 1:
             valid_prediction.append(p)
-        else:
-            visibility[int(p.name)] == False
+            visibility[int(p.name)] = True
 
-    max_d_x += 10
-    max_d_y += 10
+    max_d_x += 5
+    max_d_y += 5
     no_consecutive = 0
     outliers = []
     prediction_ = prediction
@@ -136,7 +136,6 @@ def outliers_detector(prediction, max_d_x, max_d_y):
         crt_idx = int(valid_prediction[v].name)
         prev_idx = int(valid_prediction[v - 1].name)
         idx_dif = crt_idx - prev_idx
-
 
         try:
             assert idx_dif == 1, "no consecutive frames"
@@ -168,7 +167,7 @@ def outliers_detector(prediction, max_d_x, max_d_y):
 def get_y_cords(new_predictions, show=False):
     """
     Function that returns y-axis coordinates from list of annotations
-    :param show: boolean indicating whwather show or NOT results in real time.
+    :param show: boolean indicating whether show or NOT results in real time.
     :param new_predictions: list of input predictions
     :return: list with y-coordinates extracted from new_predictions
     """
@@ -339,12 +338,17 @@ class BallTracking_improved:
         # Load Predicted values.
         self.load_predictions()
 
-        # Load Ground truth values
-        self.load_gt_annotations()
+        try:
+            # Load Ground truth values
+            self.load_gt_annotations()
+        except FileNotFoundError:
+            # No GT available for this video! proceed without any gt annotations
+            self.gt_annotations = self.predictions
 
         # Get metrics comparing GT and Vanilla TrackNet.
         get_metrics(gt=self.gt_annotations, prediction=self.predictions)
 
+        # self.infer_parabolic_curve()
         self.custom_predictions = self.infer_trajectory_kalman()
         get_metrics(gt=self.predictions, prediction=self.custom_predictions)
 
@@ -353,7 +357,7 @@ class BallTracking_improved:
 
         y_filter = filter_down_peaks(y_pred)
         eval_gradient(y_filter, True)
-
+        self.show_predictions(predictions_show=self.predictions)
         self.show_trajectory()
 
     def load_gt_annotations(self):
@@ -386,7 +390,7 @@ class BallTracking_improved:
         # pop out first row (header)
         _ = self.predictions.pop(0)
 
-    def infer_trajectory_kalman(self, mx=45, my=30, num_repressors=15):
+    def infer_trajectory_kalman(self, mx=25, my=10, num_repressors=20):
         """
         Method that will infer missing data from predictions given by TrackNetV2 using Kalman filter.
         :param num_repressors: number previous points taken into account to predict next position
@@ -436,7 +440,7 @@ class BallTracking_improved:
                 dif_x, dif_y = kalman[0] - _pdr_prev[-1].x, kalman[1] - _pdr_prev[-1].y
 
                 # if predicted kalman coordinate is greater than allowed intra frame distance -> adapt prediction.
-                if abs(dif_x) > mx or abs(dif_y) > my:
+                if (abs(dif_x) > mx or abs(dif_y) > my) and dif_x > 0. and dif_y > 0.:
 
                     sign_x = dif_x / abs(dif_x)
                     sign_y = dif_y / abs(dif_y)
@@ -459,6 +463,77 @@ class BallTracking_improved:
                 cords[miss_idx] = cords[miss_idx + 1]
 
         return self.custom_predictions
+
+    def infer_parabolic_curve(self):
+
+        def parabola(coef, x):
+            a, b, c = coef
+            return a * x ** 2 + b * x + c
+
+        def residuals(coef, x, y):
+            return parabola(coef, x) - y
+
+        # Get ball position data over time.
+        time = np.arange(0, self.v_num_frames-1, 1)
+        position_x = [0] * (self.v_num_frames - 1)
+        position_y = [0] * (self.v_num_frames - 1)
+
+        positions_initi = self.predictions
+        for i, p in enumerate(positions_initi):
+            position_x[i] = p.x
+            position_y[i] = p.y
+
+        # Approximate initial coefficients of the parabolic equation (y = a(x²) + b(x) + c
+        initial_guess = [1, 1, 1]
+
+        # Get detected positions of TrackNet (badminton)
+        position_x = np.array(position_x)
+        position_y = np.array(position_y)
+        time = np.array(time)
+
+        # Use 'least squares' to adjusts samples over time (ball position) to the parabolic curve form.
+        result = least_squares(residuals, initial_guess, args=(time, position_y))
+        a_fit, b_fit, c_fit = result.x
+
+        # load video to show results.
+        video_path = self.video_name
+        cap = cv2.VideoCapture(video_path)
+
+        ret, frame = cap.read()
+        height, width, _ = frame.shape
+
+        # Create output video writer.
+        output_path = 'video_salida.mp4'
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, cap.get(cv2.CAP_PROP_FPS), (width, height))
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+
+            if not ret:
+                break
+
+            frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+
+            # Compute ball coordinates with parabolic correction.
+            x_current = frame_num
+            y_current = parabola([a_fit, b_fit, c_fit], x_current)
+
+            x_img = position_x[frame_num - 1]
+            y_img = position_y[frame_num - 1]
+
+            cv2.circle(frame, (x_img, y_img), 5, (0, 0, 255), -1)
+            cv2.line(frame, (x_img, y_img), (int(x_current), int(y_current)), (0, 255, 0), 2)
+
+            cv2.imshow('parabolic adjustment', frame)
+            if cv2.waitKey(100) & 0xFF == ord('q'):
+                break
+
+            out.write(frame)
+
+        cap.release()
+        out.release()
+        cv2.destroyAllWindows()
 
     def show_trajectory(self):
         """
@@ -513,12 +588,11 @@ class BallTracking_improved:
     def show_predictions(self, predictions_show):
 
         cap = self.video_capture
-        number_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        number_frames = self.v_num_frames
 
         for i in range(number_frames):
             success, image = cap.read()
-            current_f = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-            assert current_f == int(predictions_show[i].name), "No same frames"
+
             wk = 100
 
             if predictions_show[i].vis == 1:
@@ -534,11 +608,13 @@ class BallTracking_improved:
 
             cv2.imshow('video', image)
             cv2.waitKey(wk)
+            self.video_writer.write(image)
 
         cv2.destroyAllWindows()
+        self.release_files()
 
     def release_files(self):
-        self.predict_csv_file.close()
+        # self.predict_csv_file.close()
         self.output_csv_file.close()
         self.video_capture.release()
         self.video_capture.release()

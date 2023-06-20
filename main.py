@@ -1,4 +1,5 @@
 import numpy as np
+import pickle
 import torch
 import json
 import cv2
@@ -7,7 +8,7 @@ import os
 from source.court_detection.CourtDetector import courtDetection, get_line_center
 from source.court_detection.CourtRefernce import CourtReference
 
-from source.pose_estimation.poseEstimation import playersDetection
+from source.pose_estimation.poseEstimation import playersDetection, dump_data
 from source.pose_estimation.utils import calculate_feet_positions
 
 from source.ball_tracking.TrackNet_BallTracker import BallTracking
@@ -26,16 +27,17 @@ globals()
 videos = ['game1_Clip4.mp4', 'game2_Clip8.mp4', 'game3_Clip7.mp4', 'video_input2.mp4', 'video_input3.mp4',
           'video_input4.mp4', 'video_input5.mp4', 'video_input6.mp4', 'video_input8.mp4', 'point_1.mp4', 'point_5.mp4']
 
-video_name = videos[2]
+video_name = videos[-2]
 
 code_config.set_result_directory(video_name)
-
+"""
 # Define ball tracking variable and execute tracking
 ballTracker = BallTracking(video_name=video_name, Cfg=code_config)
 ballTracker.track_ball()
 
 c_ballTracker = BallTracking_improved(video_name=video_name, Cfg=code_config)
 c_ballTracker.custom_tracking()
+"""
 
 # Get average mask from the three first frames of the video
 lines, bottom_mask, top_mask, H, invH = courtDetection(video_name)
@@ -75,6 +77,16 @@ top_player_coord = {'detections': '', 'frame_idx': -1}
 return_value, frame = vid.read()
 number_frames = int(vid.get(cv2.CAP_PROP_FRAME_COUNT))
 
+return_value, frame = vid.read()
+frame_idx = frame_count
+# Print court lines over frame
+for i in range(0, len(lines), 4):
+    x1, y1, x2, y2 = lines[i], lines[i + 1], lines[i + 2], lines[i + 3]
+    cv2.line(frame, (x1, y1), (x2, y2), (220, 220, 220), 5)
+
+cv2.imshow('court_line', frame)
+cv2.waitKey(0)
+
 frames = []
 original_frames = []
 
@@ -88,7 +100,6 @@ while return_value:
 
         original_frame = frame.copy()
         original_frames.append(original_frame)
-
         bottom_court = original_frame.copy()
         bottom_court[bottom_mask == 0, :] = (0, 0, 0)
         playerDetector.detect_player_bottom(frame=frame, bottom_mask=bottom_court, baseline=baseline_bottom,
@@ -98,7 +109,6 @@ while return_value:
         top_court[top_mask == 0, :] = (0, 0, 0)
         top_boxes = playerDetector.detect_candidates_top(frame=frame, top_mask=top_court, baseline=baseline_top,
                                                          frame_idx=frame_count)
-
         # Print court lines over frame
         for i in range(0, len(lines), 4):
             x1, y1, x2, y2 = lines[i], lines[i + 1], lines[i + 2], lines[i + 3]
@@ -117,8 +127,19 @@ while return_value:
 
 # Release video object.
 release_video(vid)
-guardar_video(frames=top_Detections, nombre_video=os.path.join(code_config.get_FINAL_DIR(), 'detecciones_top'), fps=fps)
+guardar_video(frames=top_Detections, nombre_video=os.path.join(code_config.get_RESULT_VIDEO_OUTPUT(), 'detection_top'),
+              fps=fps)
+'''
+with open('candidate_bboxes.pkl', 'rb') as fp:
+    top_bboxes = pickle.load(fp)
 
+with open('candidate_hists.pkl', 'rb') as fp:
+    top_hists = pickle.load(fp)
+
+playerDetector.top_candidate_boxes = top_bboxes
+playerDetector.top_candidate_appearance = top_hists
+playerDetector.best_top_candidate_id = 1
+'''
 # empty Torch cache memory
 torch.cuda.empty_cache()
 
@@ -138,7 +159,7 @@ with open(path_result_p1, 'w') as file:
 # Guardar el diccionario con bboxes del jugador 2 en un archivo JSON
 path_result_p2 = os.path.join(code_config.get_RESULT_VIDEO_OUTPUT(), 'coord_p2.json')
 bounding_boxes_serializable_2 = {key: value.tolist() if isinstance(value, np.ndarray) else value
-                                for key, value in boxes_p2.items() if value is not None}
+                                 for key, value in boxes_p2.items() if value is not None}
 with open(path_result_p2, 'w') as file:
     json.dump(bounding_boxes_serializable_2, file)
 
@@ -147,10 +168,12 @@ frame_number = 0
 orig_frame = 0
 out = playerDetector.get_video_writer()
 
+print('bboxes p1: ', len(boxes_p1))
+print('bboxes_p2: ', len(boxes_p2))
+
 top_coords_p1, top_coords_p2 = calculate_feet_positions(invH=invH, player_1_boxes=boxes_p1,
                                                         keypoints_p1=playerDetector.player_bottom_keypoints,
-                                                        player_2_boxes=boxes_p2,
-                                                        keypoints_p2=playerDetector.player_top_keypoints)
+                                                        player_2_boxes=boxes_p2)
 
 original_court = referenceCourt.court.copy()
 
@@ -171,9 +194,11 @@ for img in frames:
     upper_view = resize_upper_view(input_image=upper_view)
 
     top_view.write(upper_view.astype(np.uint8))
+    cv2.imshow('track_top', img)
+    cv2.waitKey(40)
     out.write(img)
     frame_number += 1
 
-top_view.release()
+# top_view.release()
 out.release()
 playerDetector.release_video()

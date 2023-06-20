@@ -1,4 +1,5 @@
 import os
+import pickle
 
 import cv2
 import numpy as np
@@ -7,9 +8,6 @@ import torchvision.models as models
 
 from PIL import Image
 from torchvision.transforms import transforms as transforms
-# from skimage.feature import local_binary_pattern
-
-from source.pose_estimation.keypointRCNN import load_model
 
 import source.pose_estimation.utils as utils_pose
 from source.pose_estimation.sort import Sort
@@ -23,6 +21,13 @@ def get_model(min_size=800):
     model = models.detection.keypointrcnn_resnet50_fpn(pretrained=True, num_keypoints=17, min_size=min_size)
     # model = load_model()
     return model
+
+
+def get_model_top(min_size=800):
+    # Initialize model (to detect top candidates)
+    detection_model = models.detection.fasterrcnn_resnet50_fpn(pretrained=True, min_size=min_size)
+
+    return detection_model
 
 
 def bbox_center(bbox):
@@ -125,6 +130,15 @@ def area_of_box(box):
     return height * width
 
 
+def dump_data(candidate_boxes, candidate_hists):
+
+    with open('candidate_bboxes.pkl', 'wb') as fp:
+        pickle.dump(candidate_boxes, fp)
+
+    with open('candidate_hists.pkl', 'wb') as fp:
+        pickle.dump(candidate_hists, fp)
+
+
 class playersDetection:
 
     def __init__(self, video_name, Cfg, debug=True):
@@ -148,6 +162,7 @@ class playersDetection:
         self.device = None
         self.min_size = None
         self.transform = None
+        self.model_top = None
 
         # Define bottom player detection and tracking related class variables
         self.player_bottom_detections = []
@@ -156,15 +171,14 @@ class playersDetection:
         self.bottom_misses = 0
 
         # Define top player detection related class variables
-        self.sort_MOT = Sort(max_age=10, min_hits=3, iou_threshold=0.05)
+        self.sort_MOT = Sort(max_age=10, min_hits=3, iou_threshold=0.1)
         self.candidate_first_appearance = {}
         self.top_candidate_appearance = {}
-        self.top_candidate_detections = {}
-        self.top_candidate_keypoints = {}
         self.top_candidate_boxes = {}
+        self.static_candidates = None
         self.top_player_first_h = None
         self.top_misses = 0
-        self.min_top_thr = 0.35
+        self.min_top_thr = 0.6
 
         # Define top player tracking related class variables
         self.best_top_candidate_id = None
@@ -177,7 +191,7 @@ class playersDetection:
 
         # Define first detections related class variables.
         self.top_player_margin = 50
-        self.bottom_player_margin = 100
+        self.bottom_player_margin = 60
         self.min_distance_to_baseline = 150
 
         self.top_baseline = None
@@ -243,6 +257,7 @@ class playersDetection:
     def init_model(self):
         # load the model on the computation device
         self.model = get_model(min_size=self.min_size).to(device=self.device).eval()
+        self.model_top = get_model_top(min_size=self.min_size).to(device=self.device).eval()
 
     def detect_candidates_top(self, frame, top_mask, baseline, frame_idx):
 
@@ -252,19 +267,21 @@ class playersDetection:
         self.top_baseline = baseline
 
         # Detect all persons in the top part of the court.
-        outputs = self.detect(orig_frame=frame, image_court=iteration_mask)
-        num_detections = len(outputs[0]['boxes'])
+        bboxes, scores = self.detect_top(image_court=iteration_mask, person_min_score=self.min_top_thr)
+        num_detections = len(bboxes)
+
+        bboxes = np.array(bboxes)
+        scores = np.array(scores)
 
         if num_detections > 0:
 
             # Filter detections with score < self.min_top_thr
-            scores = outputs[0]['scores'][:].cpu().detach().numpy()
             index = np.where(scores > self.min_top_thr)[0]
 
             # Store all detections whose detection score > self.min_top_thr
             if len(index) > 0:
-                scores = outputs[0]['scores'][outputs[0]['scores'] > self.min_top_thr].cpu().detach().numpy()
-                bboxes = outputs[0]['boxes'][outputs[0]['scores'] > self.min_top_thr].cpu().detach().numpy()
+                scores = scores[index]
+                bboxes = bboxes[index]
 
                 # If we are in the first frame, add restriction of distance to baseline.
                 # For the next detections, Kalman filter is applied in SORT tracker.
@@ -277,7 +294,7 @@ class playersDetection:
                     print('Candidate id: ', outputs_id, ' distance: ', distances, ' and score: ', scores)
                     if distances[outputs_id] < 100.:
                         self.best_top_candidate_id = outputs_id + 1
-                        # self.top_player_first_h = self.model_top_candidate(image=frame, bbox=bboxes[outputs_id])
+                        self.static_candidates = np.where(scores != np.max(scores))[0] + 1
                         self.top_player_first_h = self.model_top_candidates_Hue(image=frame, bbox=bboxes[outputs_id])
                     else:
                         bboxes = None
@@ -300,16 +317,9 @@ class playersDetection:
                 if candidate_id not in self.top_candidate_boxes.keys():
                     self.top_candidate_boxes[candidate_id] = ([None] * self.total_fps)
                     self.top_candidate_appearance[candidate_id] = ([None] * self.total_fps)
-                    self.top_candidate_keypoints[candidate_id] = ([None] * self.total_fps)
                     self.candidate_first_appearance[candidate_id] = frame_idx
 
-                # Find keypoints detected for current element tracked to be stored in dictionary of specific id.
-                current_bbox = box[:4]
-                detection_index = find_closest_index(arr=bboxes, current=current_bbox)
-                keypoints = outputs[0]['keypoints'][detection_index].cpu().detach().numpy()
-
                 self.top_candidate_boxes[candidate_id][frame_idx] = box[:4]
-                self.top_candidate_keypoints[candidate_id][frame_idx] = keypoints
                 self.top_candidate_appearance[candidate_id][frame_idx] = hist
 
                 cv2.rectangle(boxes, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), [255, 0, 0], 2)
@@ -348,6 +358,7 @@ class playersDetection:
             outputs = self.detect(orig_frame=frame, image_court=iteration_mask)
             # No previous detections, compute feature extraction to track over videos
             bottom_player = self.get_initial_detection(detections=outputs, bottom=True, baseline=self.bottom_baseline)
+            player_keypoints, bbox = bottom_player
 
         else:
             # Get last detected bounding box for bottom player and define new searching windows.
@@ -356,27 +367,29 @@ class playersDetection:
             last_bbox = self.player_bottom_boxes[last_detection]
 
             iteration_mask = self.get_iteration_mask(last_box=last_bbox, mask=frame,
-                                                     margin=self.top_player_margin)
+                                                     margin=self.bottom_player_margin)
 
             # Detect people in current frame with searching window set from last detection.
             outputs = self.detect(orig_frame=frame, image_court=iteration_mask)
             bottom_player = self.track_player(detections=outputs, last_det=last_bbox, bottom=True)
-            if not bottom_player:
+
+            player_keypoints, bbox = bottom_player
+
+            if bbox is None:
                 self.player_bottom_detections.append(False)
                 self.player_bottom_boxes[frame_idx] = self.player_bottom_boxes[last_detection]
                 self.player_bottom_keypoints[frame_idx] = self.player_bottom_keypoints[last_detection]
                 return
 
         # output_image = frame
-        if bottom_player:
-            player_keypoints = bottom_player[0]
-            bbox = bottom_player[1]
+        if player_keypoints is not None:
+            self.player_bottom_detections.append(True)
             self.player_bottom_boxes[frame_idx] = bbox
             self.player_bottom_keypoints[frame_idx] = player_keypoints
-            self.player_bottom_detections.append(True)
-            # output_image = utils_pose.draw_keypoints_and_boxes(player_keypoints, bbox, frame)
         else:
             self.player_bottom_detections.append(False)
+            self.player_bottom_boxes[frame_idx] = None
+            self.player_bottom_keypoints[frame_idx] = None
 
         # press `q`to exit
         if 0xFF == ord('q'):
@@ -450,18 +463,12 @@ class playersDetection:
                 return [keypoints, bbox]
             else:
                 print('Bottom persons tracking not performed! Candidate with small confidence!')
-                if bottom:
-                    self.bottom_misses += 1
-                else:
-                    self.top_misses += 1
-                return None
+                self.bottom_misses += 1
+                return [None, None]
         else:
             print('Bottom persons tracking not performed! NO candidate detected!')
-            if bottom:
-                self.bottom_misses += 1
-            else:
-                self.top_misses += 1
-            return None
+            self.bottom_misses += 1
+            return [None, None]
 
     def get_iteration_mask(self, mask, last_box, margin):
         x0, y0, x1, y1 = last_box
@@ -481,14 +488,16 @@ class playersDetection:
 
     def find_player_top(self):
 
-        # Initialize variables
-        keypoints = [None] * self.total_fps
+        # Store detection data to .pkl file (to re-use without need of running detection every time).
+        dump_data(self.top_candidate_boxes, self.top_candidate_appearance)
 
         # Get the first no None element in players ID's list to start tracking.
-        playerID = next((element for element in self.top_player_IDs if element is not None), None)
+        # playerID = next((element for element in self.top_player_IDs if element is not None), None)
+        playerID = self.best_top_candidate_id
         fisrt_player = next((index for index, element in enumerate(self.top_player_IDs) if element is not None), None)
 
         first_appearance_frame = list(set(self.candidate_first_appearance.values()))
+        num_no_Detections = 0
 
         for frame_idx in range(fisrt_player, self.total_fps - 1):
             print('Framce id: ', frame_idx)
@@ -497,28 +506,40 @@ class playersDetection:
             cumulated_bboxes = self.top_candidate_boxes[playerID][fisrt_player:frame_idx]
             last_bbox = next((element for element in reversed(cumulated_bboxes) if element is not None), None)
             print('Last Bounding box: ', last_bbox)
+            valid = True
 
             if top_player_bbox is not None:
                 # Get all histograms stored from candidate first appearance until actual frame to get las available hist
                 cumulated_hists = self.top_candidate_appearance[playerID][fisrt_player:frame_idx]
                 last_hist = next((element for element in reversed(cumulated_hists) if element is not None), None)
-
-                if frame_idx in first_appearance_frame and last_bbox is not None and frame_idx > 0:
-                    playerID = self.reId(last_bbox=last_bbox, last_Hist=last_hist,
-                                         frame_idx=frame_idx, playerID=playerID)
+                if num_no_Detections > 0 and frame_idx > 0:
+                    # Re-appearance of previous candidate! Compare if this one still being the best one.
+                    playerID, valid = self.reId(last_bbox=last_bbox, last_Hist=last_hist, frame_idx=frame_idx,
+                                                playerID=playerID, no_consecutive_detections=num_no_Detections)
             else:
-                # Get all histograms stored from candidate first appearance until actual frame to get las available hist
-                cumulated_hists = self.top_candidate_appearance[playerID][fisrt_player:frame_idx]
-                last_hist = next((element for element in reversed(cumulated_hists) if element is not None), None)
+                # Check weather if the current player id being tracked will appear in the future, or it's totally lost.
+                candidate_comeback = self.top_candidate_boxes[playerID][frame_idx:]
 
-                playerID = self.reId(last_bbox=last_bbox, last_Hist=last_hist, frame_idx=frame_idx, playerID=playerID)
+                # Player_Id will not appear in future frames, new player id must be found from candidates.
+                if all(cc is None for cc in candidate_comeback):
+                    # Get all histograms stored from candidate first appearance until actual frame to get las
+                    # available hist
+                    cumulated_hists = self.top_candidate_appearance[playerID][fisrt_player:frame_idx]
+                    last_hist = next((element for element in reversed(cumulated_hists) if element is not None), None)
 
-            self.player_top_boxes[frame_idx] = self.top_candidate_boxes[playerID][frame_idx]
-            keypoints[frame_idx] = self.top_candidate_keypoints[playerID][frame_idx]
+                    playerID, valid = self.reId(last_bbox=last_bbox, last_Hist=last_hist, frame_idx=frame_idx,
+                                                playerID=playerID)
+                else:
+                    valid = False
+                    num_no_Detections += 1
 
-        self.player_top_keypoints = keypoints
+            if valid:
+                self.player_top_boxes[frame_idx] = self.top_candidate_boxes[playerID][frame_idx]
+                num_no_Detections = 0
+            else:
+                self.player_top_boxes[frame_idx] = None
 
-    def reId(self, last_bbox, last_Hist, frame_idx, playerID):
+    def reId(self, last_bbox, last_Hist, frame_idx, playerID, no_consecutive_detections=1):
 
         # Initialize parameters for re-Identification.
         first_appearance_ids = list(set(self.candidate_first_appearance.keys()))
@@ -527,11 +548,13 @@ class playersDetection:
         last_playerHist = last_Hist
 
         fist_playerHist = self.top_player_first_h
-        max_score = 0
+        max_score = 0.2
 
         for candidate_id in first_appearance_ids:
             candidate_hist = self.top_candidate_appearance[candidate_id][frame_idx]
-            if candidate_hist is not None:
+            valid_candidate = self.compute_candidate_trajectory(candidate_id, frame_idx)
+
+            if candidate_hist is not None and candidate_id not in self.static_candidates and valid_candidate:
 
                 norm_hist2 = fist_playerHist / np.sum(fist_playerHist)
 
@@ -547,7 +570,7 @@ class playersDetection:
                 bc_score = min(calculate_bhattacharyya_distance(hist1=norm_hist1, hist2=norm_hist2), 1)
 
                 # Combine Inverse Bhattacharyya Distance and distance to previous player bbox distance to get score.
-                score = bc_score * 0.8 + distance * 0.2
+                score = bc_score * 0.85 + distance * 0.15
                 print('Candidate id: ', candidate_id, ' Score: ', score, ' with respect to: ', playerID)
 
                 candidate_area = area_of_box(box=candidateBbox)
@@ -556,11 +579,42 @@ class playersDetection:
                 area_diff = min(candidate_area, lastDect_area) / max(candidate_area, lastDect_area)
                 print('Area difference: ', area_diff)
                 print('Distance: ', prev_distance)
-                if score >= max_score and prev_distance < 50. and area_diff > 0.3:
+
+                min_dist = (no_consecutive_detections * 10.) + 20.
+
+                if score >= max_score and prev_distance < min_dist and area_diff > 0.3:
                     max_score = score
                     playerID = candidate_id
 
-        return playerID
+        if max_score > 0.2:
+            return playerID, True
+        else:
+            # No best candidate detected, not returning player id!
+            return playerID, False
+
+    def compute_candidate_trajectory(self, candidate_id, frame_idx):
+        """
+        Function to compute top candidate trajectory in order to allow or discard candidate to be considered in tracking
+        Note! static candidates won't be considered as suitable candidates in reIdentification process.
+        :return: True if candidate is valid, False if not.
+        """
+        # Get all bboxes from candidate to compute trajectory over time.
+        candidate_bboxes = [element for element in filter(lambda x: x is not None,
+                                                          self.top_candidate_boxes[candidate_id][frame_idx:])]
+
+        candidate_centers = [bbox_center(c_box) for c_box in candidate_bboxes]
+
+        total_distance = 0.0
+
+        for i in range(1, len(candidate_centers)):
+            distancia = np.linalg.norm(np.array(candidate_centers[i - 1]) - np.array(candidate_centers[i]))
+            total_distance += distancia
+
+        print('Total disatance: ', total_distance, ' for candidate id: ', candidate_id)
+        if total_distance < 85.:
+            return False
+
+        return True
 
     def mark_player_box(self, frame, boxes, frame_num, bottom=False):
         box = boxes[frame_num]
@@ -586,3 +640,30 @@ class playersDetection:
             outputs = self.model(image)
 
         return outputs
+
+    def detect_top(self, image_court, person_min_score=None):
+        """
+        Use deep learning model to detect all person in the image
+        """
+        if person_min_score is None:
+            person_min_score = self.min_top_thr
+
+        pil_image = Image.fromarray(image_court).convert('RGB')
+
+        # transform image
+        image = self.transform(pil_image)
+        # add a batch dimension
+        image = image.unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            # forward pass
+            p = self.model_top(image)
+
+        persons_boxes = []
+        probs = []
+        for box, label, score in zip(p[0]['boxes'][:], p[0]['labels'], p[0]['scores']):
+            if label == 1 and score > person_min_score:
+                persons_boxes.append(box.detach().cpu().numpy())
+                probs.append(score.detach().cpu().numpy())
+
+        return persons_boxes, probs

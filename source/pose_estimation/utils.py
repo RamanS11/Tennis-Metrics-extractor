@@ -51,7 +51,7 @@ def draw_keypoints_and_boxes(keypoints, bbox, image):
     return image
 
 
-def calculate_feet_positions(invH, player_1_boxes, keypoints_p1, player_2_boxes, keypoints_p2):
+def calculate_feet_positions(invH, player_1_boxes, keypoints_p1, player_2_boxes):
     """
     Calculate the feet position of both players using the inverse transformation of the court and the boxes
     of both players
@@ -62,7 +62,7 @@ def calculate_feet_positions(invH, player_1_boxes, keypoints_p1, player_2_boxes,
     detected_p1 = [False] * num_frames
 
     # Bottom player feet locations
-    for i, box in enumerate(player_1_boxes):
+    for i, box in player_1_boxes.items():
         if box is not None:
             left_knee = keypoints_p1[i][15]
             right_knee = keypoints_p1[i][16]
@@ -93,33 +93,22 @@ def calculate_feet_positions(invH, player_1_boxes, keypoints_p1, player_2_boxes,
     detected_p2 = [False] * num_frames
 
     # Top player feet locations
-    for i, box_2 in enumerate(player_2_boxes):
+    for i, box_2 in player_2_boxes.items():
 
-        if player_2_boxes[i] is not None:
+        if box_2 is not None:
 
-            try:
-                left_knee = keypoints_p2[i][15]
-                right_knee = keypoints_p2[i][16]
-            except TypeError:
-                left_knee = [False]
-                right_knee = [False]
-                pass
-
-            if left_knee[-1] and right_knee[-1]:
-                # Compute mean knees positions (if visible) and transform using inverse Histogram matrix.
-                avg_x = int(left_knee[0] + (right_knee[0] - left_knee[0]) / 2)
-                avg_y = int(left_knee[1] + (right_knee[1] - left_knee[1]) / 2)
-                feet_pos = np.array([avg_x, avg_y], dtype=np.float32).reshape((1, 1, 2))
-            else:
-                # Compute player position using bottom bbox line (if knees are not visible!)
-                feet_pos = np.array([(box_2[0] + (box_2[2] - box_2[0]) / 2).item(), box_2[3].item()],
-                                    dtype=np.float32).reshape((1, 1, 2))
+            # Compute player position using bottom bbox line (if knees are not visible!)
+            feet_pos = np.array([(box_2[0] + (box_2[2] - box_2[0]) / 2).item(), box_2[3].item()],
+                                dtype=np.float32).reshape((1, 1, 2))
 
             feet_court_pos = cv2.perspectiveTransform(feet_pos, invH).reshape(-1)
             positions_2[i] = feet_court_pos
             detected_p2[i] = True
-        elif i > 0:
-            positions_2[i] = positions_2[i-1]
+        elif i > 1:
+            try:
+                positions_2[i] = positions_2[i-1]
+            except IndexError:
+                print('Index: ', i, ' error!, total number of detections: ', len(player_2_boxes.keys()))
         else:
             positions_2[i] = np.array([0, 0])
 
